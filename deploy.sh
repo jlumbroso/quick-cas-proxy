@@ -66,8 +66,13 @@ mkdir -p "$CAS_DIR"
 
 echo "Deploying to: $CAS_DIR"
 
-cp quick-cas.php "$CAS_DIR/"
-cp .htaccess "$CAS_DIR/"
+#cp quick-cas.php "$CAS_DIR/"
+#cp .htaccess "$CAS_DIR/"
+
+# Use install to ensure correct permissions and ownership
+# and to avoid changing the timestamp of the files
+install -m 644 -C quick-cas.php "$CAS_DIR/quick-cas.php"
+install -m 644 -C .htaccess "$CAS_DIR/.htaccess"
 
 ln -sf "$CAS_DIR/quick-cas.php" "$CAS_DIR/login.php"
 ln -sf "$CAS_DIR/quick-cas.php" "$CAS_DIR/validate.php"
