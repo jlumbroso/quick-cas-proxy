@@ -1,8 +1,17 @@
+# Shibboleth: Require PennKey login for this directory
 AuthType shibboleth
 ShibRequestSetting requireSession 1
 Require shib-session
 
-RewriteEngine On
-RewriteRule ^login$ login.php [L]
-RewriteRule ^validate$ validate.php [L]
-RewriteRule ^serviceValidate$ serviceValidate.php [L]
+# If RewriteEngine is allowed, you can uncomment the section below
+# to enable CAS-style endpoint URLs like /cas/login → index.php/login
+
+# <IfModule mod_rewrite.c>
+# RewriteEngine On
+# RewriteBase /~lumbroso/cgi-bin/cas/
+#
+# # Allow direct CAS endpoints (only works if index.php is present)
+# RewriteRule ^login$          index.php/login [L]
+# RewriteRule ^validate$       index.php/validate [L]
+# RewriteRule ^serviceValidate$ index.php/serviceValidate [L]
+# </IfModule>

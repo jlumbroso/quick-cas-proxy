@@ -1,11 +1,17 @@
 <?php
-// CONFIGURATION
+#!/usr/bin/env php
+
+// quick-cas-proxy: Unified CAS endpoint router using index.php dispatcher mode
+// Author: Jérémie Lumbroso
+// License: MPL-2.0
+
+// Configuration
 const STORAGE_TYPE = 'FILE'; // or 'SQLITE'
 const TICKET_PREFIX = '/tmp/cas_ticket_';
 const SQLITE_PATH = '/tmp/quickcas.db';
 const TICKET_TTL = 300; // seconds
 
-// Ticket Storage Abstraction
+// ----- STORAGE LAYER -----
 function store_ticket($ticket, $user) {
     if (STORAGE_TYPE === 'SQLITE') {
         $db = new PDO("sqlite:" . SQLITE_PATH);
@@ -39,21 +45,27 @@ function validate_ticket($ticket) {
     }
 }
 
-// login.php
-if (basename($_SERVER['SCRIPT_NAME']) === 'login.php') {
+// ----- CAS ENDPOINTS -----
+function run_login() {
     $service = $_GET['service'] ?? '';
-    if (!$service) die("Missing 'service' parameter.");
+    if (!$service) {
+        http_response_code(400);
+        echo "Missing 'service' parameter.";
+        exit;
+    }
     $user = $_SERVER['REMOTE_USER'] ?? null;
-    if (!$user) die("User not authenticated.");
-
+    if (!$user) {
+        http_response_code(403);
+        echo "User not authenticated.";
+        exit;
+    }
     $ticket = 'ST-' . bin2hex(random_bytes(16));
     store_ticket($ticket, $user);
     header("Location: {$service}?ticket={$ticket}");
     exit;
 }
 
-// validate.php
-if (basename($_SERVER['SCRIPT_NAME']) === 'validate.php') {
+function run_validate() {
     $ticket = $_GET['ticket'] ?? '';
     $service = $_GET['service'] ?? '';
     if (!$ticket || !$service) {
@@ -65,8 +77,7 @@ if (basename($_SERVER['SCRIPT_NAME']) === 'validate.php') {
     exit;
 }
 
-// serviceValidate.php
-if (basename($_SERVER['SCRIPT_NAME']) === 'serviceValidate.php') {
+function run_serviceValidate() {
     header('Content-Type: text/xml');
     $ticket = $_GET['ticket'] ?? '';
     $service = $_GET['service'] ?? '';
@@ -76,10 +87,34 @@ if (basename($_SERVER['SCRIPT_NAME']) === 'serviceValidate.php') {
     }
     $user = validate_ticket($ticket);
     if ($user) {
-        echo "<cas:serviceResponse xmlns:cas='http://www.yale.edu/tp/cas'><cas:authenticationSuccess><cas:user>{$user}</cas:user></cas:authenticationSuccess></cas:serviceResponse>";
+        echo "<cas:serviceResponse xmlns:cas='http://www.yale.edu/tp/cas'><cas:authenticationSuccess><cas:user>{$user}</cas:user>";
+        // Forward Shibboleth attributes if available
+        $attrs = ['givenName', 'sn', 'displayName', 'mail', 'employeeNumber', 'affiliation', 'unscoped_affiliation'];
+        foreach ($attrs as $attr) {
+            if (!empty($_SERVER[$attr])) {
+                echo "<cas:attribute name=\"$attr\">" . htmlspecialchars($_SERVER[$attr]) . "</cas:attribute>";
+            }
+        }
+        echo "</cas:authenticationSuccess></cas:serviceResponse>";
     } else {
         echo "<cas:serviceResponse xmlns:cas='http://www.yale.edu/tp/cas'><cas:authenticationFailure code='INVALID_TICKET'>Ticket {$ticket} not recognized</cas:authenticationFailure></cas:serviceResponse>";
     }
     exit;
+}
+
+// ----- DISPATCH FROM index.php (optional) -----
+if (basename($_SERVER['SCRIPT_NAME']) === 'index.php') {
+    $path = $_SERVER['PATH_INFO'] ?? ($_GET['action'] ?? '');
+    if ($path[0] !== '/') $path = '/' . $path;
+
+    switch ($path) {
+        case '/login': run_login(); break;
+        case '/validate': run_validate(); break;
+        case '/serviceValidate': run_serviceValidate(); break;
+        default:
+            http_response_code(404);
+            echo "Unknown path: $path\n";
+            exit;
+    }
 }
 ?>
