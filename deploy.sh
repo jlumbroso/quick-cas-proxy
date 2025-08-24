@@ -26,7 +26,7 @@ Behavior:
       verifying wrapper files and warning if modified.
 
 Flags:
-  --repair-wrappers   Overwrite validate.php and serviceValidate.php in target with known-good templates.
+  --repair-wrappers   Overwrite login.php, validate.php and serviceValidate.php in target with known-good templates.
   -h, --help          Show this help.
 
 Notes:
@@ -113,6 +113,7 @@ smart_install() {
 # -------- Copy files from repo --------
 smart_install "quick-cas.php"        "${CAS_DIR}/quick-cas.php"         0644
 smart_install "index.php"            "${CAS_DIR}/index.php"             0644
+smart_install "login.php"            "${CAS_DIR}/login.php"             0644
 smart_install "validate.php"         "${CAS_DIR}/validate.php"          0644
 smart_install "serviceValidate.php"  "${CAS_DIR}/serviceValidate.php"   0644
 smart_install ".htaccess"            "${CAS_DIR}/.htaccess"             0644
@@ -125,6 +126,11 @@ smart_install "quick-cas/access_list" "${CONF_DIR}/access_list"         0644
 chmod 711 "${CAS_DIR}" || true
 
 # -------- Wrapper templates (for optional repair) --------
+WRAP_LOGIN='<?php
+// DO NOT EDIT: thin endpoint wrapper; logic lives in quick-cas.php
+require_once __DIR__."/quick-cas.php";
+run_login();
+'
 WRAP_VALIDATE='<?php
 // DO NOT EDIT: thin endpoint wrapper; logic lives in quick-cas.php
 require_once __DIR__."/quick-cas.php";
@@ -156,19 +162,27 @@ verify_wrapper() {
 
 echo "==> Verifying wrapper files"
 VERIFY_FAIL=0
+verify_wrapper "${CAS_DIR}/login.php" 'run_login\(' 'login.php' || VERIFY_FAIL=1
 verify_wrapper "${CAS_DIR}/validate.php" 'run_validate\(' 'validate.php' || VERIFY_FAIL=1
 verify_wrapper "${CAS_DIR}/serviceValidate.php" 'run_serviceValidate\(' 'serviceValidate.php' || VERIFY_FAIL=1
 
 if [[ "${REPAIR_WRAPPERS}" == "yes" ]]; then
   echo "==> --repair-wrappers specified; writing known-good wrappers"
+  printf "%s" "${WRAP_LOGIN}"           > "${CAS_DIR}/login.php"
   printf "%s" "${WRAP_VALIDATE}"        > "${CAS_DIR}/validate.php"
   printf "%s" "${WRAP_SERVICEVALIDATE}" > "${CAS_DIR}/serviceValidate.php"
-  chmod 0644 "${CAS_DIR}/validate.php" "${CAS_DIR}/serviceValidate.php"
+  chmod 0644 "${CAS_DIR}/login.php" "${CAS_DIR}/validate.php" "${CAS_DIR}/serviceValidate.php"
   VERIFY_FAIL=0
 fi
 
 if [[ "${VERIFY_FAIL}" -ne 0 ]]; then
   echo "NOTE: To repair wrappers automatically, re-run with --repair-wrappers"
+fi
+
+# -------- Verify .htaccess rules --------
+
+if [[ -f "${CAS_DIR}/.htaccess" ]] && ! grep -Eq 'Files\\s+"serviceValidate\\.php"|FilesMatch' "${CAS_DIR}/.htaccess"; then
+  echo "WARN: .htaccess may still Shib-gate serviceValidate.php; ensure it's public as shown above."
 fi
 
 # -------- Summary & tips --------
@@ -188,7 +202,7 @@ else
 fi
 echo
 echo "Test login (PennKey-gated):"
-echo "  https://alliance.seas.upenn.edu/~${ME_USER}/cgi-bin/cas/index.php/login?service=https://example.com"
+echo "  https://alliance.seas.upenn.edu/~${ME_USER}/cgi-bin/cas/login.php?service=https://example.com"
 echo
 echo "Test CAS 2.0 serviceValidate (should be PUBLIC, return XML error if missing params):"
 echo "  https://alliance.seas.upenn.edu/~${ME_USER}/cgi-bin/cas/serviceValidate.php"

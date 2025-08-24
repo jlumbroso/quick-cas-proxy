@@ -23,4 +23,10 @@ Require shib-session
 # RewriteRule ^login$          index.php/login [L]
 # RewriteRule ^validate$       index.php/validate [L]
 # RewriteRule ^serviceValidate$ index.php/serviceValidate [L]
+# #
+# # --- Optional friendly URLs (uncomment to enable) ---
+# RewriteEngine On
+# RewriteRule ^login$            login.php            [L]
+# RewriteRule ^validate$         validate.php         [L]  # CAS 1.0
+# RewriteRule ^serviceValidate$  serviceValidate.php  [L]  # CAS 2.0
 # </IfModule>
