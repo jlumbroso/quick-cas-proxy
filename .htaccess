@@ -11,6 +11,10 @@ Require shib-session
   ShibRequestSetting requireSession 0
   Require all granted
 </Files>
+<Files "p3_serviceValidate.php">
+  ShibRequestSetting requireSession 0
+  Require all granted
+</Files>
 
 # Hardening / hygiene
 Options -Indexes

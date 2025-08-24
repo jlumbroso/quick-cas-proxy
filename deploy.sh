@@ -117,12 +117,13 @@ smart_install() {
 }
 
 # -------- Copy files from repo --------
-smart_install "quick-cas.php"        "${CAS_DIR}/quick-cas.php"         0644
-smart_install "index.php"            "${CAS_DIR}/index.php"             0644
-smart_install "login.php"            "${CAS_DIR}/login.php"             0644
-smart_install "validate.php"         "${CAS_DIR}/validate.php"          0644
-smart_install "serviceValidate.php"  "${CAS_DIR}/serviceValidate.php"   0644
-smart_install ".htaccess"            "${CAS_DIR}/.htaccess"             0644
+smart_install "quick-cas.php"          "${CAS_DIR}/quick-cas.php"            0644
+smart_install "index.php"              "${CAS_DIR}/index.php"                0644
+smart_install "login.php"              "${CAS_DIR}/login.php"                0644
+smart_install "validate.php"           "${CAS_DIR}/validate.php"             0644
+smart_install "serviceValidate.php"    "${CAS_DIR}/serviceValidate.php"      0644
+smart_install "p3_serviceValidate.php" "${CAS_DIR}/p3_serviceValidate.php"   0644
+smart_install ".htaccess"              "${CAS_DIR}/.htaccess"                0644
 
 # Config subdir (+ access_list)
 chmod 711 "${CONF_DIR}" || true
@@ -146,6 +147,11 @@ WRAP_SERVICEVALIDATE='<?php
 // DO NOT EDIT: thin endpoint wrapper; logic lives in quick-cas.php
 require_once __DIR__."/quick-cas.php";
 run_serviceValidate();
+'
+WRAP_P3_SERVICEVALIDATE='<?php
+// DO NOT EDIT: thin endpoint wrapper; logic lives in quick-cas.php
+require_once __DIR__."/quick-cas.php";
+run_p3_serviceValidate();
 '
 
 # -------- Verify wrappers --------
@@ -171,12 +177,14 @@ VERIFY_FAIL=0
 verify_wrapper "${CAS_DIR}/login.php" 'run_login\(' 'login.php' || VERIFY_FAIL=1
 verify_wrapper "${CAS_DIR}/validate.php" 'run_validate\(' 'validate.php' || VERIFY_FAIL=1
 verify_wrapper "${CAS_DIR}/serviceValidate.php" 'run_serviceValidate\(' 'serviceValidate.php' || VERIFY_FAIL=1
+verify_wrapper "${CAS_DIR}/p3_serviceValidate.php" 'run_p3_serviceValidate\(' 'p3_serviceValidate.php' || VERIFY_FAIL=1
 
 if [[ "${REPAIR_WRAPPERS}" == "yes" ]]; then
   echo "==> --repair-wrappers specified; writing known-good wrappers"
-  printf "%s" "${WRAP_LOGIN}"           > "${CAS_DIR}/login.php"
-  printf "%s" "${WRAP_VALIDATE}"        > "${CAS_DIR}/validate.php"
-  printf "%s" "${WRAP_SERVICEVALIDATE}" > "${CAS_DIR}/serviceValidate.php"
+  printf "%s" "${WRAP_LOGIN}"              > "${CAS_DIR}/login.php"
+  printf "%s" "${WRAP_VALIDATE}"           > "${CAS_DIR}/validate.php"
+  printf "%s" "${WRAP_SERVICEVALIDATE}"    > "${CAS_DIR}/serviceValidate.php"
+  printf "%s" "${WRAP_P3_SERVICEVALIDATE}" > "${CAS_DIR}/p3_serviceValidate.php"
   chmod 0644 "${CAS_DIR}/login.php" "${CAS_DIR}/validate.php" "${CAS_DIR}/serviceValidate.php"
   VERIFY_FAIL=0
 fi

@@ -6,10 +6,11 @@
  *   - /login            : issues a service ticket (ST) and redirects back to ?ticket=...
  *   - /validate         : CAS 1.0 (text) validation (no attributes)
  *   - /serviceValidate  : CAS 2.0 (XML) validation (returns attributes captured at /login)
+ *   - /p3/serviceValidate : CAS 3.0 (XML) validation (same XML shape as v2; added for client compat)
  *
  * Storage:
- *   - Default: SQLITE at ~/.quick-cas/quickcas.db (shared across hosts)
- *   - Optional: FILE tickets at ~/.quick-cas/tickets/cas_ticket_*
+ *   - Default: SQLITE at ~/.quick-cas/quickcas.db
+ *   - Optional: FILE tickets under ~/.quick-cas/tickets/cas_ticket_*
  *
  * Security:
  *   - Tickets are one-time, TTL-bound, and tied to 'service'
@@ -46,7 +47,7 @@ define('TICKET_DIR',  QUICKCAS_BASE.'/tickets');
 define('TICKET_PREFIX', TICKET_DIR.'/cas_ticket_');
 define('LOG_PATH', QUICKCAS_BASE.'/server.log');
 
-// Shibboleth attributes to capture at /login and include in CAS 2.0 XML
+// Shibboleth attributes to capture at /login and include in CAS 2.0/3.0 XML
 const ATTR_KEYS = [
     'givenName','sn','displayName','mail','employeeNumber',
     'affiliation','unscoped_affiliation','eppn','pennname'
@@ -56,10 +57,10 @@ const ATTR_KEYS = [
 // - TYPE: 'ALLOW' or 'BLOCK' (case-insensitive)
 // - FILENAME: relative paths are resolved against the CAS script directory
 // - LIST: additional in-code regexes (merged with file entries). Empty ⇒ no constraints for that source.
-define('ACCESS_SERVICE_LIST_TYPE', 'BLOCK');              // 'ALLOW' or 'BLOCK'
+define('ACCESS_SERVICE_LIST_TYPE', 'BLOCK');                    // 'ALLOW' or 'BLOCK'
 define('ACCESS_SERVICE_LIST_FILENAME', 'quick-cas/access_list'); // e.g. './quick-cas/access_list'
-define('ACCESS_SERVICE_LIST', []);                        // e.g. ['~^https://.*\\.seas\\.upenn\\.edu(/|$)~i']
-define('ACCESS_ENFORCE_HTTPS', true);                     // require https service URLs
+define('ACCESS_SERVICE_LIST', []);                               // e.g. ['~^https://.*\\.seas\\.upenn\\.edu(/|$)~i']
+define('ACCESS_ENFORCE_HTTPS', true);                            // require https service URLs
 
 /* =========================
  * Bootstrap: dirs & logging
@@ -101,12 +102,8 @@ function send_security_headers() {
 }
 
 /* =========================
- * Helpers: XML, Shib & Access Control
+ * Helpers: Shib & Access Control
  * ========================= */
-
-function xml($s) {
-    return htmlspecialchars($s, ENT_XML1 | ENT_COMPAT, 'UTF-8');
-}
 
 function shib_user() {
     if (!empty($_SERVER['REMOTE_USER'])) return (string)$_SERVER['REMOTE_USER'];
@@ -126,7 +123,6 @@ function capture_attrs_from_env() {
 function read_access_list_file() {
     $path = ACCESS_SERVICE_LIST_FILENAME;
     if ($path && $path[0] !== '/' && $path[0] !== '\\') {
-        // resolve relative to the directory of this script
         $path = rtrim(__DIR__, '/').'/'.$path;
     }
     if (!$path || !is_file($path)) return [];
@@ -143,7 +139,6 @@ function read_access_list_file() {
 
 function match_any_regex(array $patterns, $string) {
     foreach ($patterns as $p) {
-        // If pattern already looks delimited (~...~i), use as-is; else wrap with ~...~i
         $pat = $p;
         if (!preg_match('/^(.).*\\1[imsxuADSUXJ]*$/', $p)) {
             $pat = '~' . $p . '~i';
@@ -182,7 +177,6 @@ function enforce_service_policy($service) {
     $filePatterns = read_access_list_file();
     $patterns = array_merge(ACCESS_SERVICE_LIST, $filePatterns);
 
-    // Empty list ⇒ allow all (to avoid accidental lockout)
     if (empty($patterns)) {
         qlog("access ALLOW (no patterns) service={$url}");
         return $url;
@@ -210,7 +204,6 @@ function enforce_service_policy($service) {
         qlog("access ALLOW (BLOCK no match) service={$url}");
         return $url;
     } else {
-        // Unknown type: allow but warn
         qlog("access ALLOW (unknown type ".ACCESS_SERVICE_LIST_TYPE.") service={$url}");
         return $url;
     }
@@ -242,7 +235,7 @@ function sqlite_db() {
         issued_at INTEGER NOT NULL,
         attrs TEXT
     )");
-    // Migrate old schema if needed
+    // Best-effort migration (ignore if already exists)
     try { $db->exec("ALTER TABLE tickets ADD COLUMN attrs TEXT"); } catch (Throwable $e) { /* ignore */ }
     return $db;
 }
@@ -340,36 +333,6 @@ function validate_ticket($ticket, $service) {
 }
 
 /* =========================
- * CAS XML helpers (V2)
- * ========================= */
-
-/** Render <cas:attributes> with one child element per attribute key; split semicolon lists */
-function render_cas_attributes(array $attrs): void {
-    if (empty($attrs)) return;
-    echo "    <cas:attributes>";
-    foreach ($attrs as $key => $val) {
-        if ($val === null || $val === '') continue;
-
-        // normalize to array of values
-        $values = is_array($val) ? $val : [$val];
-        if (!is_array($val) && strpos($val, ';') !== false) {
-            $pieces = array_filter(array_map('trim', explode(';', $val)));
-            if ($pieces) $values = $pieces;
-        }
-
-        // sanitize tag name
-        $tag = preg_replace('/[^A-Za-z0-9_:-]/', '', (string)$key);
-        if ($tag === '') $tag = 'attr';
-
-        foreach ($values as $v) {
-            if ($v === '' || $v === null) continue;
-            echo "<cas:{$tag}>", xml((string)$v), "</cas:{$tag}>";
-        }
-    }
-    echo "</cas:attributes>\n";
-}
-
-/* =========================
  * Endpoints
  * ========================= */
 
@@ -426,11 +389,27 @@ function run_validate() {
     exit;
 }
 
-function run_serviceValidate() {
+/** Emit <cas:attributes> with child elements named after each attribute.
+ *  Multivalues: split on ';' or honor arrays by repeating child tag. */
+function emit_attributes_named_tags(array $attrs) {
+    if (empty($attrs)) return;
+    echo "    <cas:attributes>\n";
+    foreach ($attrs as $name => $value) {
+        $tag = preg_replace('/[^A-Za-z0-9_:-]/', '_', (string)$name); // defensive
+        $values = is_array($value) ? $value : preg_split('/\s*;\s*/', (string)$value, -1, PREG_SPLIT_NO_EMPTY);
+        if (!$values) $values = [(string)$value];
+        foreach ($values as $v) {
+            $v = (string)$v;
+            echo "      <cas:{$tag}>".htmlspecialchars($v, ENT_QUOTES, 'UTF-8')."</cas:{$tag}>\n";
+        }
+    }
+    echo "    </cas:attributes>\n";
+}
+
+/** Core XML renderer used by both v2 and p3 serviceValidate */
+function render_service_validate_xml($ticket, $service, $version_label = 'v2') {
     send_security_headers();
     header('Content-Type: text/xml; charset=UTF-8');
-    $ticket  = $_GET['ticket']  ?? '';
-    $service = $_GET['service'] ?? '';
 
     echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
     echo "<cas:serviceResponse xmlns:cas='http://www.yale.edu/tp/cas'>\n";
@@ -438,7 +417,7 @@ function run_serviceValidate() {
     if (!$ticket || !$service) {
         echo "  <cas:authenticationFailure code='INVALID_REQUEST'>Missing service or ticket</cas:authenticationFailure>\n";
         echo "</cas:serviceResponse>";
-        qlog("serviceValidate FAIL missing_params");
+        qlog("serviceValidate {$version_label} FAIL missing_params");
         exit;
     }
 
@@ -447,17 +426,30 @@ function run_serviceValidate() {
         $user  = $res['user'];
         $attrs = $res['attrs'] ?? [];
         echo "  <cas:authenticationSuccess>\n";
-        echo "    <cas:user>".xml($user)."</cas:user>\n";
-        // Emit attributes in CAS 2.0 style:
-        render_cas_attributes($attrs);
+        echo "    <cas:user>".htmlspecialchars($user, ENT_QUOTES, 'UTF-8')."</cas:user>\n";
+        if (!empty($attrs)) {
+            emit_attributes_named_tags($attrs);
+        }
         echo "  </cas:authenticationSuccess>\n";
-        qlog("serviceValidate OK ticket=$ticket user=$user attrs=".count($attrs));
+        qlog("serviceValidate {$version_label} OK ticket=$ticket user=$user attrs=".count($attrs));
     } else {
-        echo "  <cas:authenticationFailure code='INVALID_TICKET'>Ticket ".xml($ticket)." not recognized</cas:authenticationFailure>\n";
-        qlog("serviceValidate FAIL invalid_ticket ticket=$ticket");
+        echo "  <cas:authenticationFailure code='INVALID_TICKET'>Ticket ".htmlspecialchars($ticket, ENT_QUOTES, 'UTF-8')." not recognized</cas:authenticationFailure>\n";
+        qlog("serviceValidate {$version_label} FAIL invalid_ticket ticket=$ticket");
     }
     echo "</cas:serviceResponse>";
     exit;
+}
+
+function run_serviceValidate() {
+    $ticket  = $_GET['ticket']  ?? '';
+    $service = $_GET['service'] ?? '';
+    render_service_validate_xml($ticket, $service, 'v2');
+}
+
+function run_p3_serviceValidate() {
+    $ticket  = $_GET['ticket']  ?? '';
+    $service = $_GET['service'] ?? '';
+    render_service_validate_xml($ticket, $service, 'p3');
 }
 
 /* =========================
@@ -469,14 +461,16 @@ if (basename($_SERVER['SCRIPT_NAME']) === 'index.php') {
         send_security_headers();
         header('Content-Type: text/plain; charset=UTF-8');
         echo "quick-cas proxy is live.\n";
-        echo "Use /index.php/login, /index.php/validate, or /index.php/serviceValidate\n";
+        echo "Use /index.php/login, /index.php/validate,\n";
+        echo "    /index.php/serviceValidate, or /index.php/p3/serviceValidate\n";
         exit;
     }
     if ($path[0] !== '/') $path = '/'.$path;
     switch ($path) {
-        case '/login':           run_login(); break;
-        case '/validate':        run_validate(); break;
-        case '/serviceValidate': run_serviceValidate(); break;
+        case '/login':             run_login(); break;
+        case '/validate':          run_validate(); break;
+        case '/serviceValidate':   run_serviceValidate(); break;
+        case '/p3/serviceValidate':run_p3_serviceValidate(); break;
         default:
             http_response_code(404);
             send_security_headers();
@@ -485,3 +479,7 @@ if (basename($_SERVER['SCRIPT_NAME']) === 'index.php') {
             exit;
     }
 }
+
+// If you keep thin wrappers (login.php / validate.php / serviceValidate.php),
+// they should simply include this file and call the corresponding run_*()
+// and, optionally, you can add a p3 wrapper that calls run_p3_serviceValidate().
