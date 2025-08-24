@@ -1,48 +1,37 @@
 <?php
 /**
  * quick-cas.php — CAS-compatible shim over Shibboleth-protected PHP
- * - Endpoints: login (issues ST), validate (CAS 1.0), serviceValidate (CAS 2.0 XML)
- * - Storage: SQLITE (default) or FILE, with TTL and single-use tickets
- * - Tickets are bound to the `service` they were issued for
- * - Logging to ~/.quick-cas/server.log (toggle with LOG_ENABLED)
- *
- * Place this alongside:
- *   - index.php (dispatcher using PATH_INFO)
- *   - validate.php (wrapper calling run_validate())
- *   - serviceValidate.php (wrapper calling run_serviceValidate())
- *
- * .htaccess should Shib-gate login but EXEMPT validate.php and serviceValidate.php.
+ * Endpoints: login (issues ST), validate (CAS 1.0), serviceValidate (CAS 2.0 XML)
+ * Storage: SQLITE (default) or FILE, with TTL and single-use tickets
+ * Tickets are bound to the `service` and carry captured Shibboleth attributes
  */
 
-/* =========================
- * Configuration
- * ========================= */
-define('LOG_ENABLED', true);                  // toggle server-side logging
-define('STORAGE_TYPE', 'SQLITE');             // 'SQLITE' or 'FILE'
-define('TICKET_TTL', 300);                    // seconds
+define('LOG_ENABLED', true);          // toggle server-side logging
+define('STORAGE_TYPE', 'SQLITE');     // 'SQLITE' or 'FILE'
+define('TICKET_TTL', 300);            // seconds
 
-// Base dir under HOME; override by env QUICKCAS_HOME if desired
+// Where to persist data (hidden dir under $HOME by default)
 define('QUICKCAS_BASE', (function () {
     $home = getenv('QUICKCAS_HOME');
     if (!$home) {
-        $home = getenv('HOME');
-        if (!$home) $home = sys_get_temp_dir(); // last resort
-        $home = rtrim($home, '/').'/'.'.quick-cas';
+        $home = getenv('HOME') ?: sys_get_temp_dir();
+        $home = rtrim($home, '/').'/.quick-cas';
     }
     return $home;
 })());
-
-// Derived paths
 define('SQLITE_PATH', QUICKCAS_BASE.'/quickcas.db');
 define('TICKET_DIR',  QUICKCAS_BASE.'/tickets');
 define('TICKET_PREFIX', TICKET_DIR.'/cas_ticket_');
 define('LOG_PATH', QUICKCAS_BASE.'/server.log');
 
-/* =========================
- * Bootstrap: ensure dirs
- * ========================= */
+// Attribute allowlist we capture at login and include in CAS 2.0 XML
+const ATTR_KEYS = [
+    'givenName','sn','displayName','mail','employeeNumber',
+    'affiliation','unscoped_affiliation','eppn','pennname'
+];
+
+// Bootstrap dirs/files with secure perms
 function ensure_dirs() {
-    // secure defaults
     @umask(0077);
     @mkdir(QUICKCAS_BASE, 0700, true);
     @mkdir(TICKET_DIR, 0700, true);
@@ -53,20 +42,15 @@ function ensure_dirs() {
 }
 ensure_dirs();
 
-/* =========================
- * Logging helper
- * ========================= */
 function qlog($msg) {
     if (!LOG_ENABLED) return;
     @file_put_contents(LOG_PATH, "[".date('c')."] ".$msg."\n", FILE_APPEND);
 }
 
-/* =========================
- * Storage helpers
- * ========================= */
+// ---------- Storage (SQLITE/FILE) ----------
 
 function sqlite_available() {
-    return class_exists('PDO') && in_array('sqlite', \PDO::getAvailableDrivers(), true);
+    return class_exists('PDO') && in_array('sqlite', PDO::getAvailableDrivers(), true);
 }
 
 function sqlite_db() {
@@ -75,47 +59,51 @@ function sqlite_db() {
         http_response_code(500);
         exit("quick-cas: SQLITE driver not available; switch STORAGE_TYPE to FILE or enable pdo_sqlite");
     }
-    $db = new \PDO("sqlite:".SQLITE_PATH, null, null, [
-        \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
-        \PDO::ATTR_DEFAULT_FETCH_MODE => \PDO::FETCH_ASSOC,
+    $db = new PDO("sqlite:".SQLITE_PATH, null, null, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
     ]);
+    // Create (new) table with attrs column
     $db->exec("CREATE TABLE IF NOT EXISTS tickets (
         ticket TEXT PRIMARY KEY,
         user TEXT NOT NULL,
         service TEXT NOT NULL,
-        issued_at INTEGER NOT NULL
+        issued_at INTEGER NOT NULL,
+        attrs TEXT
     )");
+    // Migrate old table missing 'attrs'
+    try { $db->exec("ALTER TABLE tickets ADD COLUMN attrs TEXT"); } catch (Exception $e) { /* already there */ }
     return $db;
 }
 
 /**
- * Store a newly issued ticket (bound to service).
+ * Store newly issued ticket with service binding and captured attrs.
+ * $attrs is an associative array of allowed attributes.
  */
-function store_ticket($ticket, $user, $service) {
+function store_ticket($ticket, $user, $service, array $attrs) {
     if (STORAGE_TYPE === 'SQLITE') {
         $db = sqlite_db();
-        $stmt = $db->prepare("INSERT INTO tickets (ticket, user, service, issued_at) VALUES (?, ?, ?, ?)");
-        $stmt->execute([$ticket, $user, $service, time()]);
-        qlog("store SQLITE ticket=$ticket user=$user service=$service");
-    } else { // FILE
+        $stmt = $db->prepare("INSERT INTO tickets (ticket, user, service, issued_at, attrs) VALUES (?, ?, ?, ?, ?)");
+        $stmt->execute([$ticket, $user, $service, time(), json_encode($attrs, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)]);
+        qlog("store SQLITE ticket=$ticket user=$user service=$service attrs=".count($attrs));
+    } else {
         $path = TICKET_PREFIX.$ticket;
-        $payload = $user."\n".time()."\n".$service;
+        $payload = $user."\n".time()."\n".$service."\n".json_encode($attrs, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
         @file_put_contents($path, $payload);
         @chmod($path, 0600);
-        qlog("store FILE ticket=$ticket path=$path user=$user service=$service");
+        qlog("store FILE ticket=$ticket path=$path user=$user service=$service attrs=".count($attrs));
     }
 }
 
 /**
- * Validate and consume a ticket; returns username on success or false on failure.
- * Enforces TTL and service binding.
+ * Validate & consume ticket; returns ['user'=>..., 'attrs'=>[...]] or false.
  */
 function validate_ticket($ticket, $service) {
     if (!$ticket || !$service) return false;
 
     if (STORAGE_TYPE === 'SQLITE') {
         $db = sqlite_db();
-        $stmt = $db->prepare("SELECT user, service, issued_at FROM tickets WHERE ticket = ?");
+        $stmt = $db->prepare("SELECT user, service, issued_at, attrs FROM tickets WHERE ticket = ?");
         $stmt->execute([$ticket]);
         $row = $stmt->fetch();
         if (!$row) { qlog("validate MISS SQLITE ticket=$ticket"); return false; }
@@ -130,10 +118,11 @@ function validate_ticket($ticket, $service) {
             qlog("validate SERVICE_MISMATCH SQLITE ticket=$ticket expected={$row['service']} got=$service");
             return false;
         }
-        // consume
-        $db->prepare("DELETE FROM tickets WHERE ticket = ?")->execute([$ticket]);
-        qlog("validate OK SQLITE ticket=$ticket user={$row['user']}");
-        return $row['user'];
+        $db->prepare("DELETE FROM tickets WHERE ticket = ?")->execute([$ticket]); // consume
+        $attrs = json_decode($row['attrs'] ?? '[]', true);
+        if (!is_array($attrs)) $attrs = [];
+        qlog("validate OK SQLITE ticket=$ticket user={$row['user']} attrs=".count($attrs));
+        return ['user'=>$row['user'], 'attrs'=>$attrs];
     }
 
     // FILE mode
@@ -142,10 +131,13 @@ function validate_ticket($ticket, $service) {
 
     $content = @file_get_contents($path);
     if ($content === false) { qlog("validate READ_FAIL FILE ticket=$ticket"); return false; }
-    $lines = explode("\n", $content, 3);
-    $user = $lines[0] ?? '';
-    $issued = (int)($lines[1] ?? 0);
-    $storedService = trim($lines[2] ?? '');
+    // user \n issued \n service \n json-attrs
+    $parts = explode("\n", $content, 4);
+    $user = $parts[0] ?? '';
+    $issued = (int)($parts[1] ?? 0);
+    $storedService = trim($parts[2] ?? '');
+    $attrs = json_decode($parts[3] ?? '[]', true);
+    if (!is_array($attrs)) $attrs = [];
 
     $age = time() - $issued;
     if ($age > TICKET_TTL) {
@@ -158,13 +150,11 @@ function validate_ticket($ticket, $service) {
         return false;
     }
     @unlink($path); // consume
-    qlog("validate OK FILE ticket=$ticket user=$user");
-    return $user;
+    qlog("validate OK FILE ticket=$ticket user=$user attrs=".count($attrs));
+    return ['user'=>$user, 'attrs'=>$attrs];
 }
 
-/* =========================
- * Endpoint implementations
- * ========================= */
+// ---------- Endpoints ----------
 
 function run_login() {
     $service = $_GET['service'] ?? '';
@@ -174,7 +164,6 @@ function run_login() {
         qlog("login FAIL missing_service");
         exit;
     }
-    // Shibboleth should set REMOTE_USER after PennKey login
     $user = $_SERVER['REMOTE_USER'] ?? ($_SERVER['pennname'] ?? null);
     if (!$user) {
         http_response_code(403);
@@ -182,9 +171,14 @@ function run_login() {
         qlog("login FAIL no_remote_user service=$service");
         exit;
     }
+    // Capture Shibboleth attributes now (browser has Shib session here)
+    $attrs = [];
+    foreach (ATTR_KEYS as $k) {
+        if (isset($_SERVER[$k]) && $_SERVER[$k] !== '') $attrs[$k] = (string)$_SERVER[$k];
+    }
 
     $ticket = 'ST-'.bin2hex(random_bytes(16));
-    store_ticket($ticket, $user, $service);
+    store_ticket($ticket, $user, $service, $attrs);
 
     $redir = $service.(strpos($service, '?') === false ? '?' : '&')."ticket=".$ticket;
     qlog("login OK user=$user ticket=$ticket redirect=$redir");
@@ -193,7 +187,6 @@ function run_login() {
 }
 
 function run_validate() {
-    // CAS 1.0 plain text
     header('Content-Type: text/plain; charset=UTF-8');
     $ticket  = $_GET['ticket']  ?? '';
     $service = $_GET['service'] ?? '';
@@ -202,9 +195,9 @@ function run_validate() {
         qlog("validate v1 FAIL missing_params");
         exit;
     }
-    $user = validate_ticket($ticket, $service);
-    if ($user) {
-        echo "yes\n".$user."\n";
+    $res = validate_ticket($ticket, $service);
+    if ($res) {
+        echo "yes\n".$res['user']."\n";
     } else {
         echo "no\n";
     }
@@ -212,9 +205,7 @@ function run_validate() {
 }
 
 function run_serviceValidate() {
-    // CAS 2.0 XML
     header('Content-Type: text/xml; charset=UTF-8');
-
     $ticket  = $_GET['ticket']  ?? '';
     $service = $_GET['service'] ?? '';
 
@@ -228,19 +219,20 @@ function run_serviceValidate() {
         exit;
     }
 
-    $user = validate_ticket($ticket, $service);
-    if ($user) {
+    $res = validate_ticket($ticket, $service);
+    if ($res) {
+        $user  = $res['user'];
+        $attrs = $res['attrs'] ?? [];
         echo "  <cas:authenticationSuccess>\n";
         echo "    <cas:user>".htmlspecialchars($user, ENT_QUOTES, 'UTF-8')."</cas:user>\n";
-        // pass through selected Shibboleth attributes if present
-        $attrs = ['givenName','sn','displayName','mail','employeeNumber','affiliation','unscoped_affiliation','eppn','pennname'];
-        foreach ($attrs as $a) {
-            if (!empty($_SERVER[$a])) {
-                echo "    <cas:attribute name=\"".$a."\">".htmlspecialchars($_SERVER[$a], ENT_QUOTES, 'UTF-8')."</cas:attribute>\n";
-            }
+        foreach ($attrs as $name => $value) {
+            // name is from allowlist; value may be multi-valued but we pass as-is
+            echo "    <cas:attribute name=\"".htmlspecialchars($name, ENT_QUOTES, 'UTF-8')."\">"
+                .htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8')
+                ."</cas:attribute>\n";
         }
         echo "  </cas:authenticationSuccess>\n";
-        qlog("serviceValidate OK ticket=$ticket user=$user");
+        qlog("serviceValidate OK ticket=$ticket user=$user attrs=".count($attrs));
     } else {
         echo "  <cas:authenticationFailure code='INVALID_TICKET'>Ticket ".htmlspecialchars($ticket, ENT_QUOTES, 'UTF-8')." not recognized</cas:authenticationFailure>\n";
         qlog("serviceValidate FAIL invalid_ticket ticket=$ticket");
@@ -249,9 +241,7 @@ function run_serviceValidate() {
     exit;
 }
 
-/* =========================
- * Optional: index.php dispatcher support
- * ========================= */
+// ---------- index.php dispatcher support ----------
 if (basename($_SERVER['SCRIPT_NAME']) === 'index.php') {
     $path = $_SERVER['PATH_INFO'] ?? ($_GET['action'] ?? '');
     if ($path === '' || $path === '/') {
@@ -261,7 +251,6 @@ if (basename($_SERVER['SCRIPT_NAME']) === 'index.php') {
         exit;
     }
     if ($path[0] !== '/') $path = '/'.$path;
-
     switch ($path) {
         case '/login':           run_login(); break;
         case '/validate':        run_validate(); break;
