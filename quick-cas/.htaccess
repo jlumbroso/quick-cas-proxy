@@ -1,0 +1,2 @@
+# Deny all HTTP access to this config dir (PHP can still read it from disk)
+Require all denied

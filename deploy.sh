@@ -93,6 +93,12 @@ CONF_DIR="${CAS_DIR}/quick-cas"
 echo "==> Deploying to: ${CAS_DIR}"
 mkdir -p "${CAS_DIR}" "${CONF_DIR}"
 
+# -------- .htaccess configuration for access list --------
+cat > "${CONF_DIR}/.htaccess" <<'EOF'
+Require all denied
+EOF
+chmod 0644 "${CONF_DIR}/.htaccess" || true
+
 # -------- Helper: smart copy (idempotent) --------
 smart_install() {
   # smart_install <src> <dest> <mode>
