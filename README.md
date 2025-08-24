@@ -252,6 +252,18 @@ if __name__ == "__main__":
 
 > Use an **HTTPS public callback** (e.g., ngrok) as your `SERVICE_URL`. The proxy enforces HTTPS by default.
 
+```
+ngrok http 6000
+```
+
+Then update your `SERVICE_URL` to the ngrok URL:
+
+```python
+SERVICE_URL = "https://<your-ngrok>.ngrok-free.app/verify"
+```
+
+You can then visit `https://<your-ngrok>.ngrok-free.app/` to test the integration.
+
 ---
 
 ## 🧪 Sanity tests
