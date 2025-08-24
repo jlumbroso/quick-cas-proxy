@@ -75,17 +75,15 @@ if (LOG_ENABLED && !is_file(LOG_PATH)) {
 function rotate_logs_if_needed() {
     if (!LOG_ENABLED || LOG_ROTATE_MAX_SIZE <= 0) return;
     clearstatcache(true, LOG_PATH);
-    if (@filesize(LOG_PATH) !== false && @filesize(LOG_PATH) >= LOG_ROTATE_MAX_SIZE) {
+    $sz = @filesize(LOG_PATH);
+    if ($sz !== false && $sz >= LOG_ROTATE_MAX_SIZE) {
         $max = max(1, (int)LOG_ROTATE_MAX_FILES);
-        // shift .(max-1) -> .max, ..., .1 -> .2
         for ($i = $max - 1; $i >= 1; $i--) {
             $src = LOG_PATH . '.' . $i;
             $dst = LOG_PATH . '.' . ($i + 1);
             if (is_file($src)) @rename($src, $dst);
         }
-        // current -> .1
         if (is_file(LOG_PATH)) @rename(LOG_PATH, LOG_PATH.'.1');
-        // new empty file
         @file_put_contents(LOG_PATH, "[".date('c')."] log rotated\n", FILE_APPEND);
         @chmod(LOG_PATH, 0600);
     }
@@ -103,8 +101,12 @@ function send_security_headers() {
 }
 
 /* =========================
- * Helpers: Shib & Access Control
+ * Helpers: XML, Shib & Access Control
  * ========================= */
+
+function xml($s) {
+    return htmlspecialchars($s, ENT_XML1 | ENT_COMPAT, 'UTF-8');
+}
 
 function shib_user() {
     if (!empty($_SERVER['REMOTE_USER'])) return (string)$_SERVER['REMOTE_USER'];
@@ -338,6 +340,36 @@ function validate_ticket($ticket, $service) {
 }
 
 /* =========================
+ * CAS XML helpers (V2)
+ * ========================= */
+
+/** Render <cas:attributes> with one child element per attribute key; split semicolon lists */
+function render_cas_attributes(array $attrs): void {
+    if (empty($attrs)) return;
+    echo "    <cas:attributes>";
+    foreach ($attrs as $key => $val) {
+        if ($val === null || $val === '') continue;
+
+        // normalize to array of values
+        $values = is_array($val) ? $val : [$val];
+        if (!is_array($val) && strpos($val, ';') !== false) {
+            $pieces = array_filter(array_map('trim', explode(';', $val)));
+            if ($pieces) $values = $pieces;
+        }
+
+        // sanitize tag name
+        $tag = preg_replace('/[^A-Za-z0-9_:-]/', '', (string)$key);
+        if ($tag === '') $tag = 'attr';
+
+        foreach ($values as $v) {
+            if ($v === '' || $v === null) continue;
+            echo "<cas:{$tag}>", xml((string)$v), "</cas:{$tag}>";
+        }
+    }
+    echo "</cas:attributes>\n";
+}
+
+/* =========================
  * Endpoints
  * ========================= */
 
@@ -385,7 +417,6 @@ function run_validate() {
         qlog("validate v1 FAIL missing_params");
         exit;
     }
-    // Optional: also enforce policy here (usually redundant)
     $res = validate_ticket($ticket, $service);
     if ($res) {
         echo "yes\n".$res['user']."\n";
@@ -393,17 +424,6 @@ function run_validate() {
         echo "no\n";
     }
     exit;
-}
-
-function emit_cas_attribute($name, $value) {
-    // Split semicolon-separated values into multiple tags
-    $parts = preg_split('/\s*;\s*/', (string)$value, -1, PREG_SPLIT_NO_EMPTY);
-    if (!$parts) $parts = [(string)$value];
-    foreach ($parts as $v) {
-        echo "    <cas:attribute name=\"".htmlspecialchars($name, ENT_QUOTES, 'UTF-8')."\">"
-            .htmlspecialchars($v, ENT_QUOTES, 'UTF-8')
-            ."</cas:attribute>\n";
-    }
 }
 
 function run_serviceValidate() {
@@ -427,14 +447,13 @@ function run_serviceValidate() {
         $user  = $res['user'];
         $attrs = $res['attrs'] ?? [];
         echo "  <cas:authenticationSuccess>\n";
-        echo "    <cas:user>".htmlspecialchars($user, ENT_QUOTES, 'UTF-8')."</cas:user>\n";
-        foreach ($attrs as $name => $value) {
-            emit_cas_attribute($name, $value);
-        }
+        echo "    <cas:user>".xml($user)."</cas:user>\n";
+        // Emit attributes in CAS 2.0 style:
+        render_cas_attributes($attrs);
         echo "  </cas:authenticationSuccess>\n";
         qlog("serviceValidate OK ticket=$ticket user=$user attrs=".count($attrs));
     } else {
-        echo "  <cas:authenticationFailure code='INVALID_TICKET'>Ticket ".htmlspecialchars($ticket, ENT_QUOTES, 'UTF-8')." not recognized</cas:authenticationFailure>\n";
+        echo "  <cas:authenticationFailure code='INVALID_TICKET'>Ticket ".xml($ticket)." not recognized</cas:authenticationFailure>\n";
         qlog("serviceValidate FAIL invalid_ticket ticket=$ticket");
     }
     echo "</cas:serviceResponse>";
