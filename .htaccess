@@ -3,11 +3,14 @@ AuthType shibboleth
 ShibRequestSetting requireSession 1
 Require shib-session
 
-# Exemption: allow anyone to access /index.php/serviceValidate
-<If \"%{REQUEST_URI} =~ m#/index\\.php/serviceValidate#\">
+<Files "serviceValidate.php">
   ShibRequestSetting requireSession 0
   Require all granted
-</If>
+</Files>
+<Files "validate.php">
+  ShibRequestSetting requireSession 0
+  Require all granted
+</Files>
 
 # If RewriteEngine is allowed, you can uncomment the section below
 # to enable CAS-style endpoint URLs like /cas/login → index.php/login
