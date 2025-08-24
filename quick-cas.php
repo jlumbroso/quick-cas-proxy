@@ -446,10 +446,79 @@ function run_serviceValidate() {
     render_service_validate_xml($ticket, $service, 'v2');
 }
 
+// function run_p3_serviceValidate() {
+//     $ticket  = $_GET['ticket']  ?? '';
+//     $service = $_GET['service'] ?? '';
+//     render_service_validate_xml($ticket, $service, 'p3');
+// }
+
+/* ===== CAS p3 helpers (put near your other helpers) ===== */
+
+function xml_text($s) {
+    return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
+}
+
+/** Make a safe XML element name (letters/underscore to start; then letters/digits/._-). */
+function safe_tag($name) {
+    $t = preg_replace('/[^A-Za-z0-9._-]/', '_', (string)$name);
+    if ($t === '' || !preg_match('/^[A-Za-z_]/', $t)) $t = '_'.$t;
+    return $t;
+}
+
+/** Emit one or more <cas:foo>value</cas:foo> for p3. Repeats tag for multi-values. */
+function emit_p3_attribute_tags($name, $value) {
+    $tag = safe_tag($name);
+    // Split semicolon lists into multiple tags (affiliation, etc.)
+    $values = is_array($value) ? $value : preg_split('/\s*;\s*/', (string)$value, -1, PREG_SPLIT_NO_EMPTY);
+    if (!$values) $values = [(string)$value];
+    foreach ($values as $v) {
+        echo '      <cas:' . $tag . '>' . xml_text($v) . '</cas:' . $tag . '>' . "\n";
+    }
+}
+
+/* ===== CAS p3 endpoint ===== */
+
 function run_p3_serviceValidate() {
+    send_security_headers();
+    header('Content-Type: text/xml; charset=UTF-8');
+
     $ticket  = $_GET['ticket']  ?? '';
     $service = $_GET['service'] ?? '';
-    render_service_validate_xml($ticket, $service, 'p3');
+
+    // XML MUST start at the very first byte — no BOM/whitespace before this echo.
+    echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+    echo "<cas:serviceResponse xmlns:cas=\"http://www.yale.edu/tp/cas\">\n";
+
+    if (!$ticket || !$service) {
+        echo "  <cas:authenticationFailure code=\"INVALID_REQUEST\">Missing service or ticket</cas:authenticationFailure>\n";
+        echo "</cas:serviceResponse>";
+        qlog("p3 serviceValidate FAIL missing_params");
+        exit;
+    }
+
+    // Validate + consume ticket
+    $res = validate_ticket($ticket, $service);
+    if (!$res) {
+        echo "  <cas:authenticationFailure code=\"INVALID_TICKET\">Ticket " . xml_text($ticket) . " not recognized</cas:authenticationFailure>\n";
+        echo "</cas:serviceResponse>";
+        qlog("p3 serviceValidate FAIL invalid_ticket ticket=$ticket");
+        exit;
+    }
+
+    $user  = $res['user'];
+    $attrs = $res['attrs'] ?? [];
+
+    echo "  <cas:authenticationSuccess>\n";
+    echo "    <cas:user>" . xml_text($user) . "</cas:user>\n";
+    echo "    <cas:attributes>\n";
+    foreach ($attrs as $k => $v) {
+        emit_p3_attribute_tags($k, $v);
+    }
+    echo "    </cas:attributes>\n";
+    echo "  </cas:authenticationSuccess>\n";
+    echo "</cas:serviceResponse>";
+    qlog("p3 serviceValidate OK ticket=$ticket user=$user attrs=" . count($attrs));
+    exit;
 }
 
 /* =========================

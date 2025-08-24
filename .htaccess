@@ -17,7 +17,7 @@ Require shib-session
 </Files>
 
 # Hardening / hygiene
-Options -Indexes
+##Options -Indexes
 
 # If RewriteEngine is allowed, you can uncomment the section below
 # to enable CAS-style endpoint URLs like /cas/login → index.php/login
