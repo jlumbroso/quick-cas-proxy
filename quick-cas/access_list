@@ -1,0 +1,26 @@
+# quick-cas/access_list
+# ---------------------------------------------
+# One regular expression per line.
+# - Blank lines and lines starting with '#' are ignored.
+# - You may use either raw regex (we’ll wrap it as "~...~i") or a fully
+#   delimited pattern yourself (e.g., "~^https://...~i").
+# - Behavior is controlled by ACCESS_SERVICE_LIST_TYPE in quick-cas.php:
+#     ALLOW: service is permitted if it matches ANY regex in this file (or in ACCESS_SERVICE_LIST).
+#            If no regexes are present, ALL services are allowed (to avoid lockout).
+#     BLOCK: service is denied if it matches ANY regex. If none match, the service is allowed.
+#
+# Examples (uncomment and adapt as needed):
+#
+# Allow *.seas.upenn.edu
+# ^https://[^/]+\.seas\.upenn\.edu(/|$)
+#
+# Allow a specific ngrok callback
+# ^https://[A-Za-z0-9-]+\.ngrok-free\.app(/|$)
+#
+# Block Google (when using BLOCK policy)
+# ^https?://(www\.)?google\.com(/|$)
+#
+# Notes:
+# - We enforce HTTPS by default (ACCESS_ENFORCE_HTTPS = true) regardless of patterns.
+# - Matching is done against the FULL service URL as passed to /login (scheme, host, path, query).
+

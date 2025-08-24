@@ -1,16 +1,38 @@
 <?php
 /**
  * quick-cas.php — CAS-compatible shim over Shibboleth-protected PHP
- * Endpoints: login (issues ST), validate (CAS 1.0), serviceValidate (CAS 2.0 XML)
- * Storage: SQLITE (default) or FILE, with TTL and single-use tickets
- * Tickets are bound to the `service` and carry captured Shibboleth attributes
+ *
+ * Endpoints:
+ *   - /login            : issues a service ticket (ST) and redirects back to ?ticket=...
+ *   - /validate         : CAS 1.0 (text) validation (no attributes)
+ *   - /serviceValidate  : CAS 2.0 (XML) validation (returns attributes captured at /login)
+ *
+ * Storage:
+ *   - Default: SQLITE at ~/.quick-cas/quickcas.db (shared across hosts)
+ *   - Optional: FILE tickets at ~/.quick-cas/tickets/cas_ticket_*
+ *
+ * Security:
+ *   - Tickets are one-time, TTL-bound, and tied to 'service'
+ *   - Service access control via ALLOW/BLOCK regex list (constant + file)
+ *   - Security headers added to all responses
+ *   - Log with rotation
  */
 
-define('LOG_ENABLED', true);          // toggle server-side logging
-define('STORAGE_TYPE', 'SQLITE');     // 'SQLITE' or 'FILE'
-define('TICKET_TTL', 300);            // seconds
+/* =========================
+ * Configuration
+ * ========================= */
 
-// Where to persist data (hidden dir under $HOME by default)
+// Logging
+define('LOG_ENABLED', true);             // toggle server-side logging
+define('LOG_ROTATE_MAX_SIZE', 1048576);  // bytes; 0 to disable rotation (default: 1 MiB)
+define('LOG_ROTATE_MAX_FILES', 5);       // how many .1, .2, ... to keep
+
+// Storage
+define('STORAGE_TYPE', 'SQLITE');        // 'SQLITE' or 'FILE'
+define('TICKET_TTL', 300);               // seconds (one-time ticket lifetime)
+define('PURGE_FACTOR', 24);              // expired purge threshold = PURGE_FACTOR * TICKET_TTL
+
+// Hidden state directory under $HOME (override with env QUICKCAS_HOME)
 define('QUICKCAS_BASE', (function () {
     $home = getenv('QUICKCAS_HOME');
     if (!$home) {
@@ -24,46 +46,193 @@ define('TICKET_DIR',  QUICKCAS_BASE.'/tickets');
 define('TICKET_PREFIX', TICKET_DIR.'/cas_ticket_');
 define('LOG_PATH', QUICKCAS_BASE.'/server.log');
 
-// Attribute allowlist we capture at login and include in CAS 2.0 XML
+// Shibboleth attributes to capture at /login and include in CAS 2.0 XML
 const ATTR_KEYS = [
     'givenName','sn','displayName','mail','employeeNumber',
     'affiliation','unscoped_affiliation','eppn','pennname'
 ];
 
-// Bootstrap dirs/files with secure perms
-function ensure_dirs() {
-    @umask(0077);
-    @mkdir(QUICKCAS_BASE, 0700, true);
-    @mkdir(TICKET_DIR, 0700, true);
-    if (LOG_ENABLED && !is_file(LOG_PATH)) {
-        @file_put_contents(LOG_PATH, "[".date('c')."] quick-cas boot\n", FILE_APPEND);
+// Service access control
+// - TYPE: 'ALLOW' or 'BLOCK' (case-insensitive)
+// - FILENAME: relative paths are resolved against the CAS script directory
+// - LIST: additional in-code regexes (merged with file entries). Empty ⇒ no constraints for that source.
+define('ACCESS_SERVICE_LIST_TYPE', 'BLOCK');              // 'ALLOW' or 'BLOCK'
+define('ACCESS_SERVICE_LIST_FILENAME', 'quick-cas/access_list'); // e.g. './quick-cas/access_list'
+define('ACCESS_SERVICE_LIST', []);                        // e.g. ['~^https://.*\\.seas\\.upenn\\.edu(/|$)~i']
+define('ACCESS_ENFORCE_HTTPS', true);                     // require https service URLs
+
+/* =========================
+ * Bootstrap: dirs & logging
+ * ========================= */
+@umask(0077);
+@mkdir(QUICKCAS_BASE, 0700, true);
+@mkdir(TICKET_DIR, 0700, true);
+if (LOG_ENABLED && !is_file(LOG_PATH)) {
+    @file_put_contents(LOG_PATH, "[".date('c')."] quick-cas boot\n", FILE_APPEND);
+    @chmod(LOG_PATH, 0600);
+}
+
+function rotate_logs_if_needed() {
+    if (!LOG_ENABLED || LOG_ROTATE_MAX_SIZE <= 0) return;
+    clearstatcache(true, LOG_PATH);
+    if (@filesize(LOG_PATH) !== false && @filesize(LOG_PATH) >= LOG_ROTATE_MAX_SIZE) {
+        $max = max(1, (int)LOG_ROTATE_MAX_FILES);
+        // shift .(max-1) -> .max, ..., .1 -> .2
+        for ($i = $max - 1; $i >= 1; $i--) {
+            $src = LOG_PATH . '.' . $i;
+            $dst = LOG_PATH . '.' . ($i + 1);
+            if (is_file($src)) @rename($src, $dst);
+        }
+        // current -> .1
+        if (is_file(LOG_PATH)) @rename(LOG_PATH, LOG_PATH.'.1');
+        // new empty file
+        @file_put_contents(LOG_PATH, "[".date('c')."] log rotated\n", FILE_APPEND);
         @chmod(LOG_PATH, 0600);
     }
 }
-ensure_dirs();
 
 function qlog($msg) {
     if (!LOG_ENABLED) return;
+    rotate_logs_if_needed();
     @file_put_contents(LOG_PATH, "[".date('c')."] ".$msg."\n", FILE_APPEND);
 }
 
-// ---------- Storage (SQLITE/FILE) ----------
+function send_security_headers() {
+    header('X-Content-Type-Options: nosniff');
+    header('Referrer-Policy: no-referrer');
+}
+
+/* =========================
+ * Helpers: Shib & Access Control
+ * ========================= */
+
+function shib_user() {
+    if (!empty($_SERVER['REMOTE_USER'])) return (string)$_SERVER['REMOTE_USER'];
+    if (!empty($_SERVER['pennname']))    return (string)$_SERVER['pennname'];
+    return null;
+}
+
+function capture_attrs_from_env() {
+    $out = [];
+    foreach (ATTR_KEYS as $k) {
+        if (isset($_SERVER[$k]) && $_SERVER[$k] !== '') $out[$k] = (string)$_SERVER[$k];
+    }
+    return $out;
+}
+
+// Read regex list from file; ignore blank lines and lines starting with '#'
+function read_access_list_file() {
+    $path = ACCESS_SERVICE_LIST_FILENAME;
+    if ($path && $path[0] !== '/' && $path[0] !== '\\') {
+        // resolve relative to the directory of this script
+        $path = rtrim(__DIR__, '/').'/'.$path;
+    }
+    if (!$path || !is_file($path)) return [];
+    $lines = @file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines === false) return [];
+    $patterns = [];
+    foreach ($lines as $ln) {
+        $ln = trim($ln);
+        if ($ln === '' || $ln[0] === '#') continue;
+        $patterns[] = $ln;
+    }
+    return $patterns;
+}
+
+function match_any_regex(array $patterns, $string) {
+    foreach ($patterns as $p) {
+        // If pattern already looks delimited (~...~i), use as-is; else wrap with ~...~i
+        $pat = $p;
+        if (!preg_match('/^(.).*\\1[imsxuADSUXJ]*$/', $p)) {
+            $pat = '~' . $p . '~i';
+        }
+        $ok = @preg_match($pat, $string);
+        if ($ok === 1) return true;
+        if ($ok === false) qlog("WARN invalid regex in access list: {$p}");
+    }
+    return false;
+}
+
+// Enforce scheme + allow/block list. Returns normalized $service (original).
+function enforce_service_policy($service) {
+    $url = $service;
+    $scheme = strtolower((string)parse_url($url, PHP_URL_SCHEME));
+    $host   = (string)parse_url($url, PHP_URL_HOST);
+
+    if (!$scheme || !$host) {
+        qlog("access DENY invalid_url service={$url}");
+        http_response_code(400);
+        send_security_headers();
+        header('Content-Type: text/plain; charset=UTF-8');
+        echo "Invalid 'service' URL.";
+        exit;
+    }
+    if (ACCESS_ENFORCE_HTTPS && $scheme !== 'https') {
+        qlog("access DENY non_https service={$url}");
+        http_response_code(400);
+        send_security_headers();
+        header('Content-Type: text/plain; charset=UTF-8');
+        echo "Service must be HTTPS.";
+        exit;
+    }
+
+    $type = strtoupper(trim((string)ACCESS_SERVICE_LIST_TYPE));
+    $filePatterns = read_access_list_file();
+    $patterns = array_merge(ACCESS_SERVICE_LIST, $filePatterns);
+
+    // Empty list ⇒ allow all (to avoid accidental lockout)
+    if (empty($patterns)) {
+        qlog("access ALLOW (no patterns) service={$url}");
+        return $url;
+    }
+
+    $matched = match_any_regex($patterns, $url);
+
+    if ($type === 'ALLOW') {
+        if ($matched) { qlog("access ALLOW (ALLOW match) service={$url}"); return $url; }
+        qlog("access DENY (ALLOW miss) service={$url}");
+        http_response_code(400);
+        send_security_headers();
+        header('Content-Type: text/plain; charset=UTF-8');
+        echo "Service not permitted by allow list.";
+        exit;
+    } elseif ($type === 'BLOCK') {
+        if ($matched) {
+            qlog("access DENY (BLOCK match) service={$url}");
+            http_response_code(400);
+            send_security_headers();
+            header('Content-Type: text/plain; charset=UTF-8');
+            echo "Service blocked by policy.";
+            exit;
+        }
+        qlog("access ALLOW (BLOCK no match) service={$url}");
+        return $url;
+    } else {
+        // Unknown type: allow but warn
+        qlog("access ALLOW (unknown type ".ACCESS_SERVICE_LIST_TYPE.") service={$url}");
+        return $url;
+    }
+}
+
+/* =========================
+ * Storage: SQLITE / FILE
+ * ========================= */
 
 function sqlite_available() {
     return class_exists('PDO') && in_array('sqlite', PDO::getAvailableDrivers(), true);
 }
-
 function sqlite_db() {
     if (!sqlite_available()) {
         qlog("ERROR: SQLITE selected but PDO_SQLITE not available");
         http_response_code(500);
+        send_security_headers();
+        header('Content-Type: text/plain; charset=UTF-8');
         exit("quick-cas: SQLITE driver not available; switch STORAGE_TYPE to FILE or enable pdo_sqlite");
     }
     $db = new PDO("sqlite:".SQLITE_PATH, null, null, [
         PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
         PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
     ]);
-    // Create (new) table with attrs column
     $db->exec("CREATE TABLE IF NOT EXISTS tickets (
         ticket TEXT PRIMARY KEY,
         user TEXT NOT NULL,
@@ -71,16 +240,34 @@ function sqlite_db() {
         issued_at INTEGER NOT NULL,
         attrs TEXT
     )");
-    // Migrate old table missing 'attrs'
-    try { $db->exec("ALTER TABLE tickets ADD COLUMN attrs TEXT"); } catch (Exception $e) { /* already there */ }
+    // Migrate old schema if needed
+    try { $db->exec("ALTER TABLE tickets ADD COLUMN attrs TEXT"); } catch (Throwable $e) { /* ignore */ }
     return $db;
 }
 
-/**
- * Store newly issued ticket with service binding and captured attrs.
- * $attrs is an associative array of allowed attributes.
- */
+function purge_expired() {
+    $threshold = time() - (TICKET_TTL * PURGE_FACTOR);
+    if (STORAGE_TYPE === 'SQLITE') {
+        $db = sqlite_db();
+        $stmt = $db->prepare("DELETE FROM tickets WHERE issued_at < ?");
+        $stmt->execute([$threshold]);
+        $cnt = $stmt->rowCount();
+        if ($cnt > 0) qlog("purge SQLITE removed={$cnt}");
+    } else {
+        $removed = 0;
+        foreach ((array)glob(TICKET_PREFIX . '*') as $file) {
+            $mt = @filemtime($file);
+            if ($mt !== false && $mt < $threshold) {
+                if (@unlink($file)) $removed++;
+            }
+        }
+        if ($removed > 0) qlog("purge FILE removed={$removed}");
+    }
+}
+
+/** Store issued ticket with bound service and captured attrs */
 function store_ticket($ticket, $user, $service, array $attrs) {
+    purge_expired(); // lazy cleanup
     if (STORAGE_TYPE === 'SQLITE') {
         $db = sqlite_db();
         $stmt = $db->prepare("INSERT INTO tickets (ticket, user, service, issued_at, attrs) VALUES (?, ?, ?, ?, ?)");
@@ -95,9 +282,7 @@ function store_ticket($ticket, $user, $service, array $attrs) {
     }
 }
 
-/**
- * Validate & consume ticket; returns ['user'=>..., 'attrs'=>[...]] or false.
- */
+/** Validate+consume ticket; returns ['user'=>..., 'attrs'=>[...]] or false */
 function validate_ticket($ticket, $service) {
     if (!$ticket || !$service) return false;
 
@@ -128,11 +313,9 @@ function validate_ticket($ticket, $service) {
     // FILE mode
     $path = TICKET_PREFIX.$ticket;
     if (!is_file($path)) { qlog("validate MISS FILE ticket=$ticket path=$path"); return false; }
-
     $content = @file_get_contents($path);
     if ($content === false) { qlog("validate READ_FAIL FILE ticket=$ticket"); return false; }
-    // user \n issued \n service \n json-attrs
-    $parts = explode("\n", $content, 4);
+    $parts = explode("\n", $content, 4); // user \n issued \n service \n json-attrs
     $user = $parts[0] ?? '';
     $issued = (int)($parts[1] ?? 0);
     $storedService = trim($parts[2] ?? '');
@@ -154,39 +337,46 @@ function validate_ticket($ticket, $service) {
     return ['user'=>$user, 'attrs'=>$attrs];
 }
 
-// ---------- Endpoints ----------
+/* =========================
+ * Endpoints
+ * ========================= */
 
 function run_login() {
     $service = $_GET['service'] ?? '';
     if (!$service) {
         http_response_code(400);
+        send_security_headers();
+        header('Content-Type: text/plain; charset=UTF-8');
         echo "Missing 'service' parameter.";
         qlog("login FAIL missing_service");
         exit;
     }
-    $user = $_SERVER['REMOTE_USER'] ?? ($_SERVER['pennname'] ?? null);
+
+    // Policy check (https + allow/block list)
+    $service = enforce_service_policy($service);
+
+    $user = shib_user();
     if (!$user) {
         http_response_code(403);
-        echo "User not authenticated (Shibboleth REMOTE_USER missing).";
+        send_security_headers();
+        header('Content-Type: text/plain; charset=UTF-8');
+        echo "User not authenticated (Shibboleth REMOTE_USER/pennname missing).";
         qlog("login FAIL no_remote_user service=$service");
         exit;
     }
-    // Capture Shibboleth attributes now (browser has Shib session here)
-    $attrs = [];
-    foreach (ATTR_KEYS as $k) {
-        if (isset($_SERVER[$k]) && $_SERVER[$k] !== '') $attrs[$k] = (string)$_SERVER[$k];
-    }
 
+    $attrs = capture_attrs_from_env();
     $ticket = 'ST-'.bin2hex(random_bytes(16));
     store_ticket($ticket, $user, $service, $attrs);
 
     $redir = $service.(strpos($service, '?') === false ? '?' : '&')."ticket=".$ticket;
-    qlog("login OK user=$user ticket=$ticket redirect=$redir");
+    qlog("login OK user=$user ticket=$ticket redirect=$redir attrs=".count($attrs));
     header("Location: ".$redir);
     exit;
 }
 
 function run_validate() {
+    send_security_headers();
     header('Content-Type: text/plain; charset=UTF-8');
     $ticket  = $_GET['ticket']  ?? '';
     $service = $_GET['service'] ?? '';
@@ -195,6 +385,7 @@ function run_validate() {
         qlog("validate v1 FAIL missing_params");
         exit;
     }
+    // Optional: also enforce policy here (usually redundant)
     $res = validate_ticket($ticket, $service);
     if ($res) {
         echo "yes\n".$res['user']."\n";
@@ -204,7 +395,19 @@ function run_validate() {
     exit;
 }
 
+function emit_cas_attribute($name, $value) {
+    // Split semicolon-separated values into multiple tags
+    $parts = preg_split('/\s*;\s*/', (string)$value, -1, PREG_SPLIT_NO_EMPTY);
+    if (!$parts) $parts = [(string)$value];
+    foreach ($parts as $v) {
+        echo "    <cas:attribute name=\"".htmlspecialchars($name, ENT_QUOTES, 'UTF-8')."\">"
+            .htmlspecialchars($v, ENT_QUOTES, 'UTF-8')
+            ."</cas:attribute>\n";
+    }
+}
+
 function run_serviceValidate() {
+    send_security_headers();
     header('Content-Type: text/xml; charset=UTF-8');
     $ticket  = $_GET['ticket']  ?? '';
     $service = $_GET['service'] ?? '';
@@ -226,10 +429,7 @@ function run_serviceValidate() {
         echo "  <cas:authenticationSuccess>\n";
         echo "    <cas:user>".htmlspecialchars($user, ENT_QUOTES, 'UTF-8')."</cas:user>\n";
         foreach ($attrs as $name => $value) {
-            // name is from allowlist; value may be multi-valued but we pass as-is
-            echo "    <cas:attribute name=\"".htmlspecialchars($name, ENT_QUOTES, 'UTF-8')."\">"
-                .htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8')
-                ."</cas:attribute>\n";
+            emit_cas_attribute($name, $value);
         }
         echo "  </cas:authenticationSuccess>\n";
         qlog("serviceValidate OK ticket=$ticket user=$user attrs=".count($attrs));
@@ -241,10 +441,13 @@ function run_serviceValidate() {
     exit;
 }
 
-// ---------- index.php dispatcher support ----------
+/* =========================
+ * Optional index.php dispatcher
+ * ========================= */
 if (basename($_SERVER['SCRIPT_NAME']) === 'index.php') {
     $path = $_SERVER['PATH_INFO'] ?? ($_GET['action'] ?? '');
     if ($path === '' || $path === '/') {
+        send_security_headers();
         header('Content-Type: text/plain; charset=UTF-8');
         echo "quick-cas proxy is live.\n";
         echo "Use /index.php/login, /index.php/validate, or /index.php/serviceValidate\n";
@@ -257,6 +460,7 @@ if (basename($_SERVER['SCRIPT_NAME']) === 'index.php') {
         case '/serviceValidate': run_serviceValidate(); break;
         default:
             http_response_code(404);
+            send_security_headers();
             header('Content-Type: text/plain; charset=UTF-8');
             echo "Unknown endpoint: $path\n";
             exit;

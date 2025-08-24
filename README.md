@@ -1,6 +1,12 @@
 # Quick CAS Proxy
 
-A lightweight CAS-compatible login proxy designed for any environment where server-side scripts (e.g. PHP) can be protected via `.htaccess`-based SSO — such as Shibboleth. This implementation is specialized for use at Penn, leveraging PennKey authentication, but the core architecture is portable to any institution with similar SSO infrastructure.
+A lightweight **CAS-compatible** login shim that sits behind **Shibboleth**. It lets you gate microservices with PennKey (or any env-integrated Shibboleth) and validate tickets via standard CAS endpoints.
+
+- **Login:** `/index.php/login?service=...` (PennKey-gated)
+- **CAS 1.0:** `/validate.php?service=...&ticket=ST-...` (public)
+- **CAS 2.0:** `/serviceValidate.php?service=...&ticket=ST-...` (public, returns CAS XML + attributes)
+
+> Works on servers such as Penn Engineering's `alliance.seas.upenn.edu` (CGI) with PennKey, but can be used anywhere your webserver exposes Shibboleth attributes to scripts and lets you add `.htaccess`.
 
 ---
 
@@ -12,178 +18,268 @@ A lightweight CAS-compatible login proxy designed for any environment where serv
   - `/index.php/validate`
   - `/index.php/serviceValidate`
 - ⚙️ Configurable backend:
-  - `FILE`-based (default) with TTL support
-  - `SQLITE` backend (optional)
+  - `FILE`-based (optional) with TTL support
+  - `SQLITE` backend (default)
 - 🪪 One-time service tickets, auto-expiring
 - 🪝 URL dispatch via `index.php`, no rewrite rules required
 - 📁 Deploys cleanly to its own subdirectory (`cgi-bin/cas/`)
 - 📤 Automatically forwards Shibboleth attributes like `displayName`, `givenName`, `mail`, `affiliation`, etc.
+- ❌ Service access control:** ALLOW/BLOCK lists using **regex** (file + in-code list)
+- 🔄 Log with log rotation (size cap, keep N files)
+- 🔐 Security headers (`X-Content-Type-Options`, `Referrer-Policy`)
+- ▫️ Minimal, portable code (no Composer deps)
+
 
 ---
 
 ## 🗂 File Structure
 
+
 After deployment, your `cgi-bin/cas/` folder will contain:
-
 ```
+
 cgi-bin/cas/
-├── quick-cas.php          ← all CAS logic, modular
-├── index.php              ← dispatches to CAS logic by path
-├── .htaccess              ← Shibboleth config only (no rewrite)
-├── deploy.sh              ← optional deployment script
-```
+.htaccess                 # Shib gate; exempts validate/serviceValidate
+index.php                 # dispatcher (PATH\_INFO)
+quick-cas.php             # core logic (this file)
+validate.php              # thin wrapper -> run\_validate()
+serviceValidate.php       # thin wrapper -> run\_serviceValidate()
+quick-cas/access\_list     # OPTIONAL: regexes for service allow/block
 
----
+````
 
-## 🚀 Quick Start
-
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/YOURNAME/quick-cas-proxy.git
-cd quick-cas-proxy
-```
-
-### 2. Deploy
-
-To deploy to your `cgi-bin` directory (e.g. `~/public_html/cgi-bin/`):
-
-```bash
-./deploy.sh ~/public_html/cgi-bin/
-```
-
-To reconfigure only (e.g. after a `git pull`), run from inside the `cas/` subdirectory:
-
-```bash
-cd ~/public_html/cgi-bin/cas/
-./deploy.sh
-```
-
----
-
-## 🔧 Configuration
-
-Inside `quick-cas.php`, you can configure:
+**Wrappers** (kept in the repo for clarity):
 
 ```php
-const STORAGE_TYPE = 'FILE'; // or 'SQLITE'
-const TICKET_PREFIX = '/tmp/cas_ticket_';
-const SQLITE_PATH = '/tmp/quickcas.db';
-const TICKET_TTL = 300; // seconds
-```
+<?php // validate.php
+// DO NOT EDIT: thin endpoint wrapper; logic lives in quick-cas.php
+require_once __DIR__.'/quick-cas.php';
+run_validate();
+````
 
-For most users, `FILE` is sufficient. Switch to `SQLITE` for concurrent or persistent usage.
+```php
+<?php // serviceValidate.php
+// DO NOT EDIT: thin endpoint wrapper; logic lives in quick-cas.php
+require_once __DIR__.'/quick-cas.php';
+run_serviceValidate();
+```
 
 ---
 
-## 🔐 Optional Rewrite Rules
+## 🔐 .htaccess
 
-If Apache `mod_rewrite` is enabled for `.htaccess`, you can use cleaner routes like `/cas/login` instead of `/cas/index.php/login`. Update `.htaccess` as follows:
+Put this in `cgi-bin/cas/.htaccess`:
 
 ```apache
-# Auth remains unchanged
+# Gate by default with Shibboleth
 AuthType shibboleth
 ShibRequestSetting requireSession 1
 Require shib-session
 
-# Optional rewrite block (commented out by default)
+# EXEMPT validation endpoints (server-to-server)
+<Files "serviceValidate.php">
+  ShibRequestSetting requireSession 0
+  Require all granted
+</Files>
+
+<Files "validate.php">
+  ShibRequestSetting requireSession 0
+  Require all granted
+</Files>
+
+# Optional pretty URLs if allowed (commented)
 # <IfModule mod_rewrite.c>
-# RewriteEngine On
-# RewriteBase /~lumbroso/cgi-bin/cas/
-# RewriteRule ^login$ index.php/login [L]
-# RewriteRule ^validate$ index.php/validate [L]
-# RewriteRule ^serviceValidate$ index.php/serviceValidate [L]
+#   RewriteEngine On
+#   RewriteBase /~<USER>/cgi-bin/cas/
+#   RewriteRule ^login$           index.php/login [L]
+#   RewriteRule ^validate$        validate.php [L]
+#   RewriteRule ^serviceValidate$ serviceValidate.php [L]
 # </IfModule>
 ```
 
-Test these by visiting:
+---
+
+## 🚀 Deploy
+
+Use the provided `deploy.sh`:
+
+```bash
+# Prepare local state (~/.quick-cas) only
+./deploy.sh
+
+# Deploy to your CGI-BIN (creates/updates cgi-bin/cas/)
+./deploy.sh ~/public_html/cgi-bin
 ```
-https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas/login?service=https://example.com
-```
+
+The script:
+
+* ensures `~/.quick-cas/{quickcas.db,tickets/,server.log}` (secure perms),
+* copies `*.php`, `.htaccess`, wrappers to `<CGI_BIN_DIR>/cas/`,
+* warns if wrappers look modified, `--repair-wrappers` can restore them.
 
 ---
 
-## 📡 CAS Endpoints
+## 🎛️ Configuration
 
-Assuming you are not using rewrite rules, use the following full URLs:
+Edit constants at the top of `quick-cas.php` as needed.
 
+### Storage
+
+* `STORAGE_TYPE`: `'SQLITE'` (default) or `'FILE'`
+* `TICKET_TTL`: validity of a ticket in seconds (default `300`)
+* Old tickets are lazily purged where `issued_at < (now - 24 * TICKET_TTL)`
+
+### Logging
+
+* `LOG_ENABLED`: enable/disable logging
+* `LOG_ROTATE_MAX_SIZE`: rotate when log reaches this many bytes (default 1 MiB)
+* `LOG_ROTATE_MAX_FILES`: keep this many rolled logs (e.g., `.1`, `.2`, …)
+
+Logs live at `~/.quick-cas/server.log`.
+
+### Attribute Passthrough
+
+At `/login`, the proxy captures Shibboleth **environment variables**:
+`givenName, sn, displayName, mail, employeeNumber, affiliation,
+unscoped_affiliation, eppn, pennname`
+
+They’re stored with the ticket and returned by `/serviceValidate` as:
+
+```xml
+<cas:authenticationSuccess>
+  <cas:user>lumbroso</cas:user>
+  <cas:attribute name="mail">lumbroso@cis.upenn.edu</cas:attribute>
+  <cas:attribute name="affiliation">member@upenn.edu</cas:attribute>
+  <cas:attribute name="affiliation">employee@upenn.edu</cas:attribute>
+  <cas:attribute name="affiliation">faculty@upenn.edu</cas:attribute>
+  ...
+</cas:authenticationSuccess>
 ```
-https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas/index.php/login
-https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas/index.php/validate
-https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas/index.php/serviceValidate
+
+> **Multi-value attributes** (like `affiliation`) are split on `;` and emitted as multiple `<cas:attribute>` tags.
+
+### Service Access Control (ALLOW/BLOCK)
+
+You can restrict which `service` URLs are permitted on `/login`.
+
+* `ACCESS_SERVICE_LIST_TYPE`: `'ALLOW'` or `'BLOCK'`
+* `ACCESS_SERVICE_LIST_FILENAME`: file with **regex** rules, one per line
+  (relative path is resolved against the CAS script directory)
+* `ACCESS_SERVICE_LIST`: extra regex rules inline
+
+Rules are **regular expressions**. You can use delimited form (`~...~i`) or raw (we’ll wrap it in `~...~i`).
+
+Examples:
+
+```txt
+# quick-cas/access_list  (ALLOW mode)
+^https://[^/]+\.seas\.upenn\.edu(/|$)
+^https://fb9c0e11601d\.ngrok-free\.app(/|$)
 ```
+
+**Behavior:**
+
+* **ALLOW:** if *any* regex matches → allowed; empty list ⇒ allow all
+* **BLOCK:** if *any* regex matches → **denied**; empty list ⇒ allow all
+* `ACCESS_ENFORCE_HTTPS`: when true (default), only `https://` services allowed
 
 ---
 
-## 🧪 Testing CAS Flow
+## 🐍 Flask Integration Example (client)
 
-To test login:
-
-```bash
-curl -i "https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas/index.php/login?service=https://example.com"
+Assuming `quick-cas-proxy` is deployed at `https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas` with the paths:
 ```
-
-To test ticket validation:
-
-```bash
-curl "https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas/index.php/validate?service=https://example.com&ticket=ST-12345"
+https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas/login.php
+https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas/serviceValidate.php
+https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas/validate.php
 ```
-
-To test serviceValidate (CAS 2.0):
-
-```bash
-curl "https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas/index.php/serviceValidate?service=https://example.com&ticket=ST-12345"
-```
-
----
-
-## 🐍 Flask Integration Example
 
 Install:
 ```bash
 pip install flask-cas-ng
 ```
 
+You will also need a way to create a tunnel to your local Flask server (e.g., [ngrok](https://ngrok.com/)).
+
+Then:
+
 ```python
-from flask import Flask
-from flask_cas_ng import CAS
+from flask import Flask, redirect, request, session, url_for
+import requests, xml.etree.ElementTree as ET
 
 app = Flask(__name__)
-app.secret_key = 'super-secret-key'
-cas = CAS(app, '/cas')
+app.secret_key = "test-key"
 
-# Your CAS proxy configuration
-app.config['CAS_SERVER'] = 'https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas'
-app.config['CAS_LOGIN_ROUTE'] = '/index.php/login'
-app.config['CAS_VALIDATE_ROUTE'] = '/index.php/validate'
-app.config['CAS_AFTER_LOGIN'] = 'cas_logged_in'
+CAS_BASE = "https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas"
+CAS_LOGIN = f"{CAS_BASE}/index.php/login"           # gated
+CAS_VALIDATE_V2 = f"{CAS_BASE}/serviceValidate.php" # public
+SERVICE_URL = "https://<your-ngrok>.ngrok-free.app/verify"
 
-@app.route('/')
-@cas.login
+@app.route("/")
 def home():
-    return f"Hello, {cas.username}!"
+    if "cas_user" in session:
+        return f"✅ Logged in as: {session['cas_user']}"
+    return redirect(url_for("login"))
 
-@app.route('/cas_logged_in')
-def cas_logged_in():
-    return f"User {cas.username} is authenticated."
+@app.route("/login")
+def login():
+    return redirect(f"{CAS_LOGIN}?service={SERVICE_URL}")
+
+@app.route("/verify")
+def verify():
+    ticket = request.args.get("ticket")
+    if not ticket: return "Missing ticket", 400
+    r = requests.get(CAS_VALIDATE_V2, params={"service": SERVICE_URL, "ticket": ticket}, allow_redirects=False, timeout=10)
+    ns = {"cas": "http://www.yale.edu/tp/cas"}
+    root = ET.fromstring(r.text)
+    success = root.find("cas:authenticationSuccess", ns)
+    if success is None: return ("Login failed\n\n"+r.text, 403)
+    user = success.find("cas:user", ns).text
+    attrs = {}
+    for a in success.findall("cas:attribute", ns):
+        attrs.setdefault(a.attrib["name"], []).append(a.text or "")
+    session["cas_user"] = user
+    session["cas_attrs"] = attrs
+    return redirect(url_for("profile"))
+
+@app.route("/profile")
+def profile():
+    return f"<h1>👤 CAS Login Successful</h1><pre>{session.get('cas_user')}\\n{session.get('cas_attrs')}</pre>"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=6000, debug=True)
 ```
+
+> Use an **HTTPS public callback** (e.g., ngrok) as your `SERVICE_URL`. The proxy enforces HTTPS by default.
 
 ---
 
-## 🛠 Git Deployment Hook
+## 🧪 Sanity tests
 
-For self-healing deployments:
-
-```bash
-git pull && ./deploy.sh ~/public_html/cgi-bin/
-```
-
-Or set up a Git post-merge hook:
+Run the included script:
 
 ```bash
-echo '#!/bin/sh\n./deploy.sh ~/public_html/cgi-bin/' > .git/hooks/post-merge
-chmod +x .git/hooks/post-merge
+# default base = https://alliance.seas.upenn.edu/~$USER/cgi-bin/cas
+./test.sh
+
+# or specify the base explicitly
+./test.sh "https://alliance.seas.upenn.edu/~lumbroso/cgi-bin/cas"
 ```
+
+It checks:
+
+* `serviceValidate.php` is **public** and returns **XML**
+* `serviceValidate.php` with no params returns **INVALID\_REQUEST** XML
+* `validate.php` with no params returns **no**
+* `index.php/login` with no `service` → **400**
+
+---
+
+## 🛠 Troubleshooting
+
+* **XML looks like HTML login page:** your `/serviceValidate.php` is still Shib-gated. See `.htaccess` exemptions.
+* **`no` on validation:** tickets are one-use & TTL-bound; also ensure login + validation hit **the same storage** (SQLite in home avoids `/tmp` pitfalls).
+* **No attributes in CAS XML:** your `/login` didn’t see Shibboleth env vars; confirm with a gated `whoami.php` or check `~/.quick-cas/server.log` for `attrs=0`.
 
 ---
 

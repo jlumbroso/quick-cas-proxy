@@ -87,10 +87,11 @@ if [[ ! -d "${CGI_BIN_DIR}" ]]; then
   exit 2
 fi
 
-# -------- Destination dir --------
+# -------- Destination dirs --------
 CAS_DIR="${CGI_BIN_DIR%/}/cas"
+CONF_DIR="${CAS_DIR}/quick-cas"
 echo "==> Deploying to: ${CAS_DIR}"
-mkdir -p "${CAS_DIR}"
+mkdir -p "${CAS_DIR}" "${CONF_DIR}"
 
 # -------- Helper: smart copy (idempotent) --------
 smart_install() {
@@ -98,7 +99,6 @@ smart_install() {
   local src="$1" dest="$2" mode="$3"
   if [[ -f "${src}" ]]; then
     if [[ -f "${dest}" ]] && cmp -s "${src}" "${dest}"; then
-      # unchanged
       :
     else
       cp -f "${src}" "${dest}"
@@ -110,14 +110,18 @@ smart_install() {
   fi
 }
 
-# -------- Copy files from repo (if present) --------
-smart_install "quick-cas.php"      "${CAS_DIR}/quick-cas.php"       0644
-smart_install "index.php"          "${CAS_DIR}/index.php"           0644
-smart_install "validate.php"       "${CAS_DIR}/validate.php"        0644
-smart_install "serviceValidate.php" "${CAS_DIR}/serviceValidate.php" 0644
-smart_install ".htaccess"          "${CAS_DIR}/.htaccess"           0644
+# -------- Copy files from repo --------
+smart_install "quick-cas.php"        "${CAS_DIR}/quick-cas.php"         0644
+smart_install "index.php"            "${CAS_DIR}/index.php"             0644
+smart_install "validate.php"         "${CAS_DIR}/validate.php"          0644
+smart_install "serviceValidate.php"  "${CAS_DIR}/serviceValidate.php"   0644
+smart_install ".htaccess"            "${CAS_DIR}/.htaccess"             0644
 
-# Directory perms: traverse but not list; readable where appropriate
+# Config subdir (+ access_list)
+chmod 711 "${CONF_DIR}" || true
+smart_install "quick-cas/access_list" "${CONF_DIR}/access_list"         0644
+
+# Directory perms
 chmod 711 "${CAS_DIR}" || true
 
 # -------- Wrapper templates (for optional repair) --------
@@ -176,6 +180,12 @@ echo "  Quick-CAS base: ${QC_BASE}"
 echo "  Tickets dir:    ${QC_TICKETS}"
 echo "  Log file:       ${QC_LOG}"
 echo "  CAS dir:        ${CAS_DIR}"
+echo "  Config dir:     ${CONF_DIR}"
+if [[ -f "${CONF_DIR}/access_list" ]]; then
+  echo "  Access list:    ${CONF_DIR}/access_list"
+else
+  echo "  Access list:    (none installed)"
+fi
 echo
 echo "Test login (PennKey-gated):"
 echo "  https://alliance.seas.upenn.edu/~${ME_USER}/cgi-bin/cas/index.php/login?service=https://example.com"
